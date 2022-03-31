@@ -1,5 +1,105 @@
+from re import X
 import tensorflow as tf
 import numpy as np
+
+class TransformerEncoderToken(tf.keras.Model):
+    def __init__(self, config):
+        super(TransformerEncoderToken, self).__init__()
+
+        self.model_dim = config["model_dim"]
+        self.num_layers = config["num_layers"]
+        self.pos_encoding = positional_encoding((config["maximum_seq_length"]*2)+1, self.model_dim)
+        self.dense = tf.keras.layers.Dense(units=self.model_dim, activation="relu")
+        self.enc_layers = [EncoderLayer(config["model_dim"], config["num_heads"], 
+            config["intermediate_dim"], config["dropout_rate"]) for _ in range(self.num_layers)]
+        self.dropout = tf.keras.layers.Dropout(config["dropout_rate"])
+        self.prediction = tf.keras.layers.Dense(units=1, activation="sigmoid", kernel_regularizer=tf.keras.regularizers.L2(l2=config["l2_reg"]))
+        if config["use_sep_token"]:
+            self.use_sep_token = True
+            self.sep_token = tf.keras.layers.Embedding(1, self.model_dim, embeddings_initializer=tf.keras.initializers.RandomUniform(0., 1.))
+        else:
+            self.use_sep_token = False
+
+        if config["use_pred_token"]:
+            self.use_pred_token = True
+            self.pred_token = tf.keras.layers.Embedding(1, self.model_dim, embeddings_initializer=tf.keras.initializers.RandomUniform(0., 1.))
+        else:
+            self.use_pred_token = False
+
+    def call(self, x, training, mask):
+        """
+        x: (batch_size, max_seq_len, feature_dim)
+        """
+        # image feature dim to model dim
+        x = self.dense(x) # (batch_size, max_seq_len, model_dim)
+
+        if self.use_sep_token:
+            sep_tensor = self.sep_token(0)
+            sep_tensor = tf.reshape(sep_tensor, (1,1,-1))
+            sep_tensor = tf.tile(sep_tensor, (x.shape[0],x.shape[1],1))
+            x = tf.reshape(tf.concat([x, sep_tensor], axis=-1), shape=(x.shape[0], x.shape[1]*2, x.shape[2]))
+            mask = tf.tile(tf.reshape(mask, shape=(mask.shape[0], mask.shape[-1], 1)), (1,1,2))
+            mask = tf.reshape(mask, shape=(mask.shape[0], 1, 1, mask.shape[1]*2))
+
+        if self.use_pred_token:
+            pred_tensor = self.pred_token(0)
+            pred_tensor = tf.reshape(pred_tensor, (1,1,-1))
+            pred_tensor = tf.tile(pred_tensor, (x.shape[0],1,1))
+            x = tf.concat([pred_tensor, x], axis=1)
+            mask = tf.concat([tf.zeros(shape=(mask.shape[0],1,1,1)), mask], axis=-1)
+
+        # add positional encoding
+
+        x *= tf.math.sqrt(tf.cast(self.model_dim, tf.float32)) # scaling embedding
+        x += self.pos_encoding[:, :x.shape[1], :]
+        x = self.dropout(x, training=training)
+
+        for i in range(self.num_layers):
+            x = self.enc_layers[i](x, training, mask) # (batch_size, input_seq_len, d_model)
+
+        return self.prediction(x)  # (batch_size, input_seq_len, 1)
+
+class TransformerEncoderSegment(tf.keras.Model):
+    def __init__(self, config):
+        super(TransformerEncoderSegment, self).__init__()
+
+        self.model_dim = config["model_dim"]
+        self.num_layers = config["num_layers"]
+        self.pos_encoding = positional_encoding(config["maximum_seq_length"], self.model_dim)
+        self.dense = tf.keras.layers.Dense(units=self.model_dim, activation="relu")
+        self.enc_layers = [EncoderLayer(config["model_dim"], config["num_heads"], 
+            config["intermediate_dim"], config["dropout_rate"]) for _ in range(self.num_layers)]
+        self.dropout = tf.keras.layers.Dropout(config["dropout_rate"])
+        self.prediction = tf.keras.layers.Dense(units=1, activation="sigmoid", kernel_regularizer=tf.keras.regularizers.L2(l2=config["l2_reg"]))
+        if config["use_segment_embedding"] == "bisegment":
+            self.use_bisegment_embedding = True
+            self.segment_embedding = tf.keras.layers.Embedding(2, self.model_dim, embeddings_initializer=tf.keras.initializers.RandomUniform(0., 1.))
+        else:
+            self.use_bisegment_embedding = False
+        if config["use_segment_embedding"] == "separate":
+            self.use_separate_segment_embedding = True
+            self.segment_embedding = tf.keras.layers.Embedding(config["maximum_seq_length"], self.model_dim, embeddings_initializer=tf.keras.initializers.RandomUniform(0., 1.))
+        else:
+            self.use_separate_segment_embedding = False
+
+    def call(self, x, segment_x, training, mask):
+        """
+        x: (batch_size, max_seq_len, feature_dim)
+        """
+        # image feature dim to model dim
+        x = self.dense(x) # (batch_size, max_seq_len, model_dim)
+        segment_tensor = self.segment_embedding(segment_x)
+
+        # add positional encoding and segment embedding
+        x *= tf.math.sqrt(tf.cast(self.model_dim, tf.float32)) # scaling embedding
+        x += self.pos_encoding[:, :x.shape[1], :]
+        x += segment_tensor
+        x = self.dropout(x, training=training)
+
+        for i in range(self.num_layers):
+            x = self.enc_layers[i](x, training, mask) # (batch_size, input_seq_len, d_model)
+
+        return self.prediction(x)  # (batch_size, input_seq_len, 1)
 
 class TransformerEncoder(tf.keras.Model):
     def __init__(self, config):
@@ -24,6 +124,38 @@ class TransformerEncoder(tf.keras.Model):
         x = self.dense(x)
         x *= tf.math.sqrt(tf.cast(self.model_dim, tf.float32)) # scaling embedding
         x += self.pos_encoding[:, :this_seq_len, :]
+        x = self.dropout(x, training=training)
+
+        for i in range(self.num_layers):
+            x = self.enc_layers[i](x, training, mask) # (batch_size, input_seq_len, d_model)
+
+        return self.prediction(x)  # (batch_size, input_seq_len, 1)
+
+class TransformerEncoderExperiment(tf.keras.Model):
+    def __init__(self, config):
+        super(TransformerEncoderExperiment, self).__init__()
+
+        self.model_dim = config["model_dim"]
+        self.num_layers = config["num_layers"]
+        self.pos_encoding = positional_encoding(config["maximum_seq_length"], self.model_dim)
+        self.dense = tf.keras.layers.Dense(units=self.model_dim, activation="relu")
+        self.enc_layers = [EncoderLayer(config["model_dim"], config["num_heads"], 
+            config["intermediate_dim"], config["dropout_rate"]) for _ in range(self.num_layers)]
+        self.dropout = tf.keras.layers.Dropout(config["dropout_rate"])
+        self.prediction = tf.keras.layers.Dense(units=1, activation="sigmoid", kernel_regularizer=tf.keras.regularizers.L2(l2=config["l2_reg"]))
+
+    def call(self, x, training, mask):
+        """
+        x: (batch_size, seq_len, feature_dim)
+        """
+        this_seq_len = tf.shape(x)[1]
+
+        # adding embedding and position encoding.
+        pos_x = self.pos_encoding[:, :this_seq_len, :]
+        pos_x = tf.tile(pos_x, (x.shape[0], 1, 1))
+        x = tf.concat([x, pos_x], axis=-1)
+        x = self.dense(x)
+        x *= tf.math.sqrt(tf.cast(self.model_dim, tf.float32)) # scaling embedding
         x = self.dropout(x, training=training)
 
         for i in range(self.num_layers):

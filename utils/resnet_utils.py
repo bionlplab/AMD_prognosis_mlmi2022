@@ -52,15 +52,10 @@ def set_augmenter():
 
     return augmenter
 
-def prepare_batch(eye_batch, dataset_dict, config, augment, one_hot=False):
+def prepare_batch(eye_batch, dataset_dict, config, augmenter=None, one_hot=False):
 
     img_size = int(config["resizing"]*config["scale"])
     batch_x_tensor = np.zeros(shape=(len(eye_batch), img_size, img_size, 3))
-
-    if augment:
-        augmeter = set_augmenter()
-    else:
-        augmeter = None
 
     if one_hot:
         batch_y_tensor = np.zeros(shape=(len(eye_batch), config["num_class"]))
@@ -69,7 +64,7 @@ def prepare_batch(eye_batch, dataset_dict, config, augment, one_hot=False):
 
     for idx, eye in enumerate(eye_batch):
         eye_filename = config["data_root_path"] + eye.split(" ")[0] + "/" + eye
-        eye_img = parse_image(eye_filename, resizing=config["resizing"], scale=config["scale"], augmenter=augmeter)
+        eye_img = parse_image(eye_filename, resizing=config["resizing"], scale=config["scale"], augmenter=augmenter)
         batch_x_tensor[idx, :, :, :] = eye_img
         if one_hot:
             batch_y_tensor[idx, :] = tf.keras.utils.to_categorical(dataset_dict[eye] - 1, num_classes=config["num_class"])
@@ -78,7 +73,7 @@ def prepare_batch(eye_batch, dataset_dict, config, augment, one_hot=False):
     
     batch_x_tensor =  tf.math.divide(batch_x_tensor, 255.)
     
-    return batch_x_tensor, batch_y_tensor
+    return tf.cast(batch_x_tensor, dtype=tf.float32), tf.cast(batch_y_tensor, dtype=tf.float32)
 
 def prepare_batch_to_extract(eye_batch, config):
 
@@ -114,14 +109,18 @@ class WeightedBinaryCrossEntropy(tf.keras.losses.Loss):
         self.class_weight = class_weight
         self.eps = 10e-07 
     
-    def call(self, y_true, y_pred):  
+    def call(self, y_true, y_pred):
+        """
+        y_true and y_pred must be flattened
+        """
         # Clipping y_pred for numerical stability 
         y_pred = tf.clip_by_value(y_pred, self.eps, 1-self.eps)
 
-        loss_tensor = tf.concat([tf.multiply(1. - y_true, tf.math.log(1.0 - y_pred)), tf.multiply(y_true, tf.math.log(y_pred))], axis=-1)
-        weighted_loss_tensor = tf.negative(tf.multiply(self.class_weight, loss_tensor))
+        loss_for_true = tf.negative(tf.multiply(y_true, tf.math.log(y_pred)) * self.class_weight[1])
+        loss_for_false = tf.negative(tf.multiply(1. - y_true, tf.math.log(1.0 - y_pred)) * self.class_weight[0])
+        weighted_loss_sum = tf.add(loss_for_true, loss_for_false)
         
-        return tf.reduce_mean(tf.reduce_sum(weighted_loss_tensor, axis=-1))
+        return tf.reduce_mean(weighted_loss_sum, axis=0)
 
 class WeightedCategoricalCrossEntropy(tf.keras.losses.Loss):
     def __init__(self, class_weight):
@@ -206,7 +205,7 @@ def calculate_auc(model, dataset_dict, config):
 
     for i in range(num_batch):
         eye_batch = data_set[i*batch_size:(i+1)*batch_size]
-        x, y = prepare_batch(eye_batch, dataset_dict, config, augment=False, one_hot=False)
+        x, y = prepare_batch(eye_batch, dataset_dict, config, augmenter=None, one_hot=False)
         y_hat = model(x, training=False)
         AUC.update_state(y_true=y, y_pred=y_hat)
 
@@ -273,20 +272,23 @@ def calculate_metrics_perlength(model, test_set_dict, per_length_test_set_dict, 
         data_list = list(length_dict.keys())
 
         AUC.reset_states()
+        prediction_count = 0
         LATE_AMD_SCORE_MEAN = tf.keras.metrics.Mean()
         NON_LATE_AMD_SCORE_MEAN = tf.keras.metrics.Mean()
             
         for i in range(num_batch):
             eye_batch = data_list[i*batch_size:(i+1)*batch_size]
             x_batch, y_batch = prepare_batch(eye_batch, length_dict, config, augment=False, one_hot=False)
+            prediction_count += x_batch.shape[0]
             y_hat = model(x_batch, training=False)
             AUC.update_state(y_true=y_batch, y_pred=y_hat)
             LATE_AMD_SCORE_MEAN.update_state(y_hat, sample_weight=y_batch)
             NON_LATE_AMD_SCORE_MEAN.update_state(y_hat, sample_weight=1.-y_batch)
 
-            result_dict[length] = {"AUC" : AUC.result().numpy(), 
-                                    "late_amd_score_mean" : LATE_AMD_SCORE_MEAN.result().numpy(),
-                                    "non_late_amd_score_mean" : NON_LATE_AMD_SCORE_MEAN.result().numpy()}
+        result_dict[length] = {"AUC" : AUC.result().numpy(),
+        "late_amd_score_mean" : LATE_AMD_SCORE_MEAN.result().numpy(),
+        "non_late_amd_score_mean" : NON_LATE_AMD_SCORE_MEAN.result().numpy(),
+        "prediction_count" : prediction_count}
 
     num_batch = int(np.ceil(float(len(test_set_dict)) / float(batch_size)))
     data_list = list(test_set_dict.keys())
@@ -294,10 +296,12 @@ def calculate_metrics_perlength(model, test_set_dict, per_length_test_set_dict, 
     AUC.reset_states()
     LATE_AMD_SCORE_MEAN = tf.keras.metrics.Mean()
     NON_LATE_AMD_SCORE_MEAN = tf.keras.metrics.Mean()
+    prediction_count = 0
 
     for i in range(num_batch):
         eye_batch = data_list[i*batch_size:(i+1)*batch_size]
         x_batch, y_batch = prepare_batch(eye_batch, test_set_dict, config, augment=False, one_hot=False)
+        prediction_count += x_batch.shape[0]
         y_hat = model(x_batch, training=False)
         AUC.update_state(y_true=y_batch, y_pred=y_hat)
         LATE_AMD_SCORE_MEAN.update_state(y_hat, sample_weight=y_batch)
@@ -305,6 +309,7 @@ def calculate_metrics_perlength(model, test_set_dict, per_length_test_set_dict, 
 
     result_dict["overall"] = {"AUC" : AUC.result().numpy(), 
                             "late_amd_score_mean" : LATE_AMD_SCORE_MEAN.result().numpy(),
-                            "non_late_amd_score_mean" : NON_LATE_AMD_SCORE_MEAN.result().numpy()}
+                            "non_late_amd_score_mean" : NON_LATE_AMD_SCORE_MEAN.result().numpy(),
+                            "prediction_count" : prediction_count}
     
     return result_dict

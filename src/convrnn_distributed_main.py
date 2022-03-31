@@ -4,7 +4,7 @@ import os
 from src.convrnn_src import *
 from utils.convrnn_distributed_utils import *
 
-def distributed_train_resnetlstm_module(output_path, data_path, architecture, epoch, per_replica_batch_size, units,
+def distributed_train_resnetlstm_module(output_path, data_path, data_dict_path, architecture, epoch, per_replica_batch_size, model_dim,
                             learning_rate, designate_gpu, l2_reg, class_weight, lr_scheduling, use_pretrain, 
                             pretrained_weights_path, pretrained_config_path, testing):
 
@@ -61,7 +61,7 @@ def distributed_train_resnetlstm_module(output_path, data_path, architecture, ep
     
         if lr_scheduling:
             lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=learning_rate, 
-                                                                         decay_steps=300, decay_rate=0.9)
+                                                                         decay_steps=600, decay_rate=0.9)
             optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
         else:    
             optimizer = tf.keras.optimizers.Adam(learning_rate)
@@ -81,10 +81,7 @@ def distributed_train_resnetlstm_module(output_path, data_path, architecture, ep
         train_progbar = tf.keras.utils.Progbar(total_train_num_batches)
         
         for train_dist_dataset_batch in train_dist_dataset:
-            try:
-                train_loss_sum += distributed_train_step(strategy, resnetlstm, optimizer, WBCE, train_AUC, train_dist_dataset_batch, global_batch_size)
-            except:
-                return train_dist_dataset_batch
+            train_loss_sum += distributed_train_step(strategy, resnetlstm, optimizer, WBCE, train_AUC, train_dist_dataset_batch, global_batch_size)
             count_num_batches += 1
             train_progbar.add(1)
         
@@ -163,5 +160,102 @@ def distributed_train_resnetlstm_module(output_path, data_path, architecture, ep
     save_data(os.path.join(output_path, "convrnn_training_loss.pkl"), train_loss)
     save_data(os.path.join(output_path, "convrnn_validation_auc.pkl"), validation_auc)
     save_data(os.path.join(output_path, "convrnn_result_dict.pkl"), per_length_result_dict)
+    model_filepath = os.path.join(output_path, "convrnn_best_model.npy")
+    np.save(model_filepath, best_model)
 
-    
+def evaluate_saved_model(model_path, data_path, config_path):
+    """
+    evaluate the saved model in non-distributed setting
+    """
+
+    print("load data...")
+    config = load_data(config_path)
+    best_model = np.load(model_path, allow_pickle=True)
+    test_AUC = tf.keras.metrics.AUC(num_thresholds=200)
+    per_length_test_AUC = tf.keras.metrics.AUC(num_thresholds=200)
+
+    validation_dataset_path = os.path.join(data_path, "validation_dataset_tf")
+    validation_dataset_elem_spec_path = os.path.join(data_path, "validation_dataset_tf_element_spec.pkl")
+    validation_dataset_elem_spec = load_data(validation_dataset_elem_spec_path)
+    validation_dataset = tf.data.experimental.load(validation_dataset_path, element_spec=validation_dataset_elem_spec)
+    validation_dataset = validation_dataset.batch(config["per_replica_batch_size"])
+
+    test_dataset_path = os.path.join(data_path, "test_dataset_tf")
+    test_dataset_elem_spec_path = os.path.join(data_path, "test_dataset_tf_element_spec.pkl")
+    test_dataset_elem_spec = load_data(test_dataset_elem_spec_path)
+    test_dataset = tf.data.experimental.load(test_dataset_path, element_spec=test_dataset_elem_spec)
+    test_dataset = test_dataset.batch(config["per_replica_batch_size"])
+
+    print("build and initialize models...")
+    resnetlstm = ResNetLSTM(config)
+
+    # initialize the model's weight
+    validation_dataset = validation_dataset.as_numpy_iterator()
+    x_batch, y_batch = validation_dataset.next()
+    x_batch = x_batch / 255.
+    _ = resnetlstm(x_batch, training=False)
+
+    # load the best model's weight
+    resnetlstm.set_weights(best_model)
+
+    for test_datset_batch in test_dataset:
+        
+        x_batch, y_batch = test_datset_batch
+        x_batch = x_batch / 255.
+        y_hat = resnetlstm(x_batch, training=False)
+        y_batch_flatten, y_hat_flatten = apply_sequential_mask(y_batch, y_hat)
+        test_AUC.update_state(y_true=y_batch_flatten, y_pred=y_hat_flatten)
+
+    test_auc = test_AUC.result().numpy()
+    print('test auc:{auc:.6f}'.format(auc=test_auc))
+
+    per_length_result_dict = dict()
+    per_length_result_dict["entire_AUC"] = test_auc
+
+    print("calculate AUC using the best model on the per length test set")
+
+    unique_length = list(range(1, 12))
+
+    for length in unique_length:
+
+        this_length_test_dataset_path = os.path.join(data_path, "per_length_test_dataset_tf/", "length_{}_test_dataset_tf".format(length))
+        this_length_test_dataset_elem_spec_path = os.path.join(data_path, "per_length_test_dataset_tf/", "length_{}_test_dataset_element_spec.pkl".format(length))
+        this_length_test_dataset_elem_spec = load_data(this_length_test_dataset_elem_spec_path)
+        this_length_test_dataset = tf.data.experimental.load(this_length_test_dataset_path, element_spec=this_length_test_dataset_elem_spec)
+        this_length_test_dataset = this_length_test_dataset.batch(config["per_replica_batch_size"])
+
+        per_length_test_AUC.reset_states()
+
+        for this_length_test_dataset_batch in this_length_test_dataset:
+            x_batch, y_batch = this_length_test_dataset_batch
+            x_batch = x_batch / 255.
+            y_hat = resnetlstm(x_batch, training=False)
+            y_batch_flatten, y_hat_flatten = apply_sequential_last_mask(y_batch, y_hat)
+            per_length_test_AUC.update_state(y_true=y_batch_flatten, y_pred=y_hat_flatten)
+            
+        this_length_test_auc = per_length_test_AUC.result().numpy()
+        per_length_result_dict[length] = this_length_test_auc
+
+    per_length_test_AUC.reset_states()
+
+    for length in unique_length:
+
+        this_length_test_dataset_path = os.path.join(data_path, "per_length_test_dataset_tf/", "length_{}_test_dataset_tf".format(length))
+        this_length_test_dataset_elem_spec_path = os.path.join(data_path, "per_length_test_dataset_tf/", "length_{}_test_dataset_element_spec.pkl".format(length))
+        this_length_test_dataset_elem_spec = load_data(this_length_test_dataset_elem_spec_path)
+        this_length_test_dataset = tf.data.experimental.load(this_length_test_dataset_path, element_spec=this_length_test_dataset_elem_spec)
+        this_length_test_dataset = this_length_test_dataset.batch(config["per_replica_batch_size"])
+
+        for this_length_test_dataset_batch in this_length_test_dataset:
+            x_batch, y_batch = this_length_test_dataset_batch
+            x_batch = x_batch / 255.
+            y_hat = resnetlstm(x_batch, training=False)
+            y_batch_flatten, y_hat_flatten = apply_sequential_last_mask(y_batch, y_hat)
+            per_length_test_AUC.update_state(y_true=y_batch_flatten, y_pred=y_hat_flatten)
+
+    entire_length_test_auc = per_length_test_AUC.result().numpy()
+    per_length_result_dict["entire_length"] = entire_length_test_auc
+
+    return per_length_result_dict
+
+

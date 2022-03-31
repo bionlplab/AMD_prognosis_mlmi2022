@@ -40,6 +40,9 @@ class ResNetLSTM(tf.keras.Model):
         return self.prediction(x) # (batch_size, max_len, 1) masked
 
 class LSTMModule(tf.keras.Model):
+    """
+    LSTM on top of the features extracted from images
+    """
     def __init__(self, config):
         super(LSTMModule, self).__init__()
         self.lstm = LSTM(config)
@@ -49,11 +52,11 @@ class LSTMModule(tf.keras.Model):
 
     def call(self, inputs, training=None):
         
-        x = self.fc(inputs) # batch_size * max_len * units
-        x = self.masking_layer(x)
-        x = self.lstm(x) # batch_size * max_len * units
+        x = self.masking_layer(inputs)
+        x = self.fc(x) # (batch_size, max_len, units)
+        x = self.lstm(x) # (batch_size, max_len, units)
 
-        return self.prediction(x) # batch_size * max_len * 1
+        return self.prediction(x) # (batch_size, max_len, 1)
 
 class LSTMAttentionModule(tf.keras.Model):
     def __init__(self, config):
