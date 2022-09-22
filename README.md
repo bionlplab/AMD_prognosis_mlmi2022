@@ -1,4 +1,5 @@
-## Predicting Age-related Macular Degeneration Progression // with Longitudinal Fundus Images using Deep Learning
+## Predicting Age-related Macular Degeneration Progression
+## with Longitudinal Fundus Images using Deep Learning
 
 This repository contains source codes for implementing models and reproducing the results in the following [paper](https://scholar.google.com/citations?user=YMqB0b0AAAAJ&hl=en):
 
