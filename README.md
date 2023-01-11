@@ -15,4 +15,6 @@ We used the data from AREDS, which was sponsored by the National Eye Institute o
 ### To implement the model
 Source codes for all models are available in src folder. Please refer model_main.py for implementation and hyperparameter setting.
 
+### [Supplementary material for the paper](https://github.com/bionlplab/AMD_prognosis_arvo2022/blob/master/supplementary_material.pdf)
+
 Please send any questions about the code to jlee351 at gatech.edu.
