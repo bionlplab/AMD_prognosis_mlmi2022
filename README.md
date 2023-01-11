@@ -17,4 +17,4 @@ Source codes for all models are available in src folder. Please refer model_main
 
 ### [Supplementary material for the paper](https://github.com/bionlplab/AMD_prognosis_arvo2022/blob/master/supplementary_material.pdf)
 
-Please send any questions about the code to jlee351 at gatech.edu.
+Please send any questions about the code to jlee3541 at gatech.edu.
